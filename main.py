@@ -1,191 +1,128 @@
-import os
-import json
-import re
+import os, json, re
 from datetime import datetime, date
 from collections import defaultdict
-import anthropic
+from anthropic import Anthropic
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+TOKEN = os.environ["TELEGRAM_TOKEN"]
+API_KEY = os.environ["ANTHROPIC_API_KEY"]
+FILE = "data.json"
+client = Anthropic(api_key=API_KEY)
 
-DATA_FILE = "data.json"
+def load():
+    return json.load(open(FILE)) if os.path.exists(FILE) else {}
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE) as f:
-            return json.load(f)
-    return {}
+def save(d):
+    json.dump(d, open(FILE,"w"), ensure_ascii=False, indent=2)
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def add(uid, t):
+    d = load()
+    d.setdefault(uid, {"tr":[]})["tr"].append(t)
+    save(d)
 
-def tambah_transaksi(uid, t):
-    data = load_data()
-    data.setdefault(uid, {"transaksi": []})
-    data[uid]["transaksi"].append(t)
-    save_data(data)
+def rp(n):
+    return f"Rp {int(n):,}".replace(",",".")
 
-def format_rp(n):
-    return f"Rp {int(n):,}".replace(",", ".")
-
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-
-SYSTEM = """Kamu asisten pencatat keuangan. Ekstrak info dari pesan dan balas HANYA JSON.
-
-Jika transaksi keuangan:
-{"terdeteksi":true,"tipe":"pengeluaran atau pemasukan","jumlah":angka,"kategori":"Makan/Transport/Belanja/Hiburan/Kesehatan/Tagihan/Gaji/Freelance/Lainnya","deskripsi":"singkat"}
-
-Jika bukan transaksi:
-{"terdeteksi":false,"pesan":"balasan ramah bahasa Indonesia"}
-
-Contoh:
-"makan 25rb" -> {"terdeteksi":true,"tipe":"pengeluaran","jumlah":25000,"kategori":"Makan","deskripsi":"makan"}
-"gaji 5jt" -> {"terdeteksi":true,"tipe":"pemasukan","jumlah":5000000,"kategori":"Gaji","deskripsi":"gaji"}"""
-
-def tanya_claude(teks):
+def tanya(teks):
     try:
         r = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=300,
-            system=SYSTEM,
-            messages=[{"role": "user", "content": teks}]
+            system='Ekstrak transaksi keuangan. Balas HANYA JSON. Jika transaksi: {"ok":true,"tipe":"pengeluaran atau pemasukan","jumlah":angka,"kat":"Makan/Transport/Belanja/Tagihan/Gaji/Lainnya","desc":"singkat"}. Jika bukan: {"ok":false,"msg":"balasan ramah"}',
+            messages=[{"role":"user","content":teks}]
         )
-        raw = r.content[0].text.strip()
-        raw = re.sub(r"```json|```", "", raw).strip()
+        raw = re.sub(r"```json|```","",r.content[0].text).strip()
         return json.loads(raw)
     except:
-        return {"terdeteksi": False, "pesan": "Maaf ada error, coba lagi ya!"}
+        return {"ok":False,"msg":"Maaf ada error, coba lagi!"}
 
-def laporan_bulan(uid):
-    data = load_data().get(uid, {}).get("transaksi", [])
-    now = datetime.now()
-    bulan_nama = ["","Januari","Februari","Maret","April","Mei","Juni",
-                  "Juli","Agustus","September","Oktober","November","Desember"]
-    filtered = [t for t in data
-                if datetime.fromisoformat(t["waktu"]).month == now.month
-                and datetime.fromisoformat(t["waktu"]).year == now.year]
-    if not filtered:
-        return "📭 Belum ada transaksi bulan ini."
-    masuk = sum(t["jumlah"] for t in filtered if t["tipe"] == "pemasukan")
-    keluar = sum(t["jumlah"] for t in filtered if t["tipe"] == "pengeluaran")
-    saldo = masuk - keluar
-    kat = defaultdict(int)
-    for t in filtered:
-        if t["tipe"] == "pengeluaran":
-            kat[t["kategori"]] += t["jumlah"]
-    baris = [
-        f"📊 *Laporan {bulan_nama[now.month]} {now.year}*",
-        f"{'─'*26}",
-        f"💰 Pemasukan: *{format_rp(masuk)}*",
-        f"💸 Pengeluaran: *{format_rp(keluar)}*",
-        f"{'─'*26}",
-    ]
-    if kat:
-        baris.append("📂 *Rincian Pengeluaran:*")
-        for k, v in sorted(kat.items(), key=lambda x: -x[1]):
-            pct = v/keluar*100 if keluar else 0
-            baris.append(f"  • {k}: {format_rp(v)} ({pct:.0f}%)")
-        baris.append(f"{'─'*26}")
-    ikon = "✅" if saldo >= 0 else "⚠️"
-    baris.append(f"{ikon} *Saldo: {format_rp(saldo)}*")
-    baris.append(f"📈 Total transaksi: {len(filtered)}")
-    return "\n".join(baris)
-
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"👋 Halo *{update.effective_user.first_name}*!\n\n"
-        "Saya bot pencatat keuangan kamu 💰\n\n"
-        "*Cara pakai — ketik langsung:*\n"
+async def start(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    await u.message.reply_text(
+        f"👋 Halo *{u.effective_user.first_name}*!\n\n"
+        "Ketik transaksi langsung:\n"
         "• `makan siang 35rb`\n"
         "• `gajian 5 juta`\n"
-        "• `bayar listrik 250rb`\n"
-        "• `grab 18000`\n\n"
-        "📋 *Perintah:*\n"
+        "• `bayar listrik 250rb`\n\n"
         "/laporan — laporan bulan ini\n"
         "/hari — transaksi hari ini\n"
         "/hapus — hapus transaksi terakhir",
         parse_mode="Markdown"
     )
 
-async def laporan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    await update.message.reply_text("⏳ Menyiapkan laporan...")
-    await update.message.reply_text(laporan_bulan(uid), parse_mode="Markdown")
-
-async def hari(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    data = load_data().get(uid, {}).get("transaksi", [])
-    hari_ini = date.today().isoformat()
-    tr = [t for t in data if t["waktu"].startswith(hari_ini)]
-    if not tr:
-        await update.message.reply_text("📭 Belum ada transaksi hari ini.")
+async def laporan(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = str(u.effective_user.id)
+    tr = load().get(uid,{}).get("tr",[])
+    now = datetime.now()
+    bl = ["","Jan","Feb","Mar","Apr","Mei","Jun","Jul","Agu","Sep","Okt","Nov","Des"]
+    f = [t for t in tr if datetime.fromisoformat(t["w"]).month==now.month and datetime.fromisoformat(t["w"]).year==now.year]
+    if not f:
+        await u.message.reply_text("📭 Belum ada transaksi bulan ini.")
         return
-    masuk = sum(t["jumlah"] for t in tr if t["tipe"] == "pemasukan")
-    keluar = sum(t["jumlah"] for t in tr if t["tipe"] == "pengeluaran")
+    masuk = sum(t["j"] for t in f if t["tipe"]=="pemasukan")
+    keluar = sum(t["j"] for t in f if t["tipe"]=="pengeluaran")
+    kat = defaultdict(int)
+    for t in f:
+        if t["tipe"]=="pengeluaran": kat[t["kat"]]+=t["j"]
+    baris = [f"📊 *Laporan {bl[now.month]} {now.year}*",f"{'─'*24}",
+             f"💰 Pemasukan: *{rp(masuk)}*",f"💸 Pengeluaran: *{rp(keluar)}*",f"{'─'*24}"]
+    for k,v in sorted(kat.items(),key=lambda x:-x[1]):
+        baris.append(f"  • {k}: {rp(v)}")
+    baris.append(f"\n{'✅' if masuk>=keluar else '⚠️'} *Saldo: {rp(masuk-keluar)}*")
+    await u.message.reply_text("\n".join(baris), parse_mode="Markdown")
+
+async def hari(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = str(u.effective_user.id)
+    tr = load().get(uid,{}).get("tr",[])
+    hi = date.today().isoformat()
+    f = [t for t in tr if t["w"].startswith(hi)]
+    if not f:
+        await u.message.reply_text("📭 Belum ada transaksi hari ini.")
+        return
+    masuk = sum(t["j"] for t in f if t["tipe"]=="pemasukan")
+    keluar = sum(t["j"] for t in f if t["tipe"]=="pengeluaran")
     baris = ["📅 *Transaksi Hari Ini*\n"]
-    for i, t in enumerate(tr, 1):
-        ikon = "💰" if t["tipe"] == "pemasukan" else "💸"
-        jam = datetime.fromisoformat(t["waktu"]).strftime("%H:%M")
-        baris.append(f"{i}. {ikon} {t['deskripsi'].capitalize()} — *{format_rp(t['jumlah'])}*  _{jam}_")
-    baris += [f"\n{'─'*24}",
-              f"💰 Masuk: {format_rp(masuk)}",
-              f"💸 Keluar: {format_rp(keluar)}",
-              f"📊 Saldo: *{format_rp(masuk-keluar)}*"]
-    await update.message.reply_text("\n".join(baris), parse_mode="Markdown")
+    for i,t in enumerate(f,1):
+        ikon = "💰" if t["tipe"]=="pemasukan" else "💸"
+        jam = datetime.fromisoformat(t["w"]).strftime("%H:%M")
+        baris.append(f"{i}. {ikon} {t['desc'].capitalize()} — *{rp(t['j'])}* _{jam}_")
+    baris += [f"\n{'─'*22}",f"📊 Saldo: *{rp(masuk-keluar)}*"]
+    await u.message.reply_text("\n".join(baris), parse_mode="Markdown")
 
-async def hapus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    data = load_data()
-    tr = data.get(uid, {}).get("transaksi", [])
+async def hapus(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = str(u.effective_user.id)
+    d = load()
+    tr = d.get(uid,{}).get("tr",[])
     if not tr:
-        await update.message.reply_text("❌ Tidak ada transaksi untuk dihapus.")
+        await u.message.reply_text("❌ Tidak ada transaksi.")
         return
-    dihapus = tr.pop()
-    save_data(data)
-    await update.message.reply_text(
-        f"🗑 Dihapus: *{dihapus['deskripsi'].capitalize()}* — {format_rp(dihapus['jumlah'])}",
-        parse_mode="Markdown"
-    )
+    x = tr.pop()
+    save(d)
+    await u.message.reply_text(f"🗑 Dihapus: *{x['desc'].capitalize()}* — {rp(x['j'])}", parse_mode="Markdown")
 
-async def pesan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    teks = update.message.text.strip()
-    hasil = tanya_claude(teks)
-    if not hasil.get("terdeteksi"):
-        await update.message.reply_text(
-            hasil.get("pesan", "Ketik nominal transaksi ya, contoh: *makan 25rb*"),
-            parse_mode="Markdown"
-        )
+async def pesan(u: Update, c: ContextTypes.DEFAULT_TYPE):
+    uid = str(u.effective_user.id)
+    h = tanya(u.message.text.strip())
+    if not h.get("ok"):
+        await u.message.reply_text(h.get("msg","Ketik transaksi ya, contoh: *makan 25rb*"), parse_mode="Markdown")
         return
-    t = {
-        "tipe": hasil["tipe"],
-        "jumlah": hasil["jumlah"],
-        "kategori": hasil["kategori"],
-        "deskripsi": hasil["deskripsi"],
-        "waktu": datetime.now().isoformat(),
-    }
-    tambah_transaksi(uid, t)
-    data = load_data().get(uid, {}).get("transaksi", [])
-    hari_ini = date.today().isoformat()
-    saldo = sum(
-        x["jumlah"] if x["tipe"] == "pemasukan" else -x["jumlah"]
-        for x in data if x["waktu"].startswith(hari_ini)
-    )
-    ikon = "💰" if hasil["tipe"] == "pemasukan" else "💸"
-    await update.message.reply_text(
-        f"{ikon} *{hasil['deskripsi'].capitalize()}* dicatat!\n"
-        f"Jumlah: *{format_rp(hasil['jumlah'])}*\n"
-        f"Kategori: {hasil['kategori']}\n"
+    t = {"tipe":h["tipe"],"j":h["jumlah"],"kat":h["kat"],"desc":h["desc"],"w":datetime.now().isoformat()}
+    add(uid, t)
+    tr = load().get(uid,{}).get("tr",[])
+    hi = date.today().isoformat()
+    saldo = sum(x["j"] if x["tipe"]=="pemasukan" else -x["j"] for x in tr if x["w"].startswith(hi))
+    ikon = "💰" if h["tipe"]=="pemasukan" else "💸"
+    await u.message.reply_text(
+        f"{ikon} *{h['desc'].capitalize()}* dicatat!\n"
+        f"Jumlah: *{rp(h['jumlah'])}*\n"
+        f"Kategori: {h['kat']}\n"
         f"─────────────────\n"
-        f"Saldo hari ini: *{format_rp(saldo)}*",
+        f"Saldo hari ini: *{rp(saldo)}*",
         parse_mode="Markdown"
     )
 
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+if __name__ == "__main__":
+    app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("laporan", laporan))
     app.add_handler(CommandHandler("hari", hari))
@@ -193,6 +130,3 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pesan))
     print("Bot aktif!")
     app.run_polling(drop_pending_updates=True)
-
-if __name__ == "__main__":
-    main()
